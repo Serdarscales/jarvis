@@ -21,6 +21,6 @@ Claude does the rest with you. Prefer to download by hand? Click the green **Cod
 
 ## Good to know
 
-- Everything runs on your own Mac. Each kit's README says exactly which services it talks to and what they cost (the free options cost nothing on top of your Claude subscription).
+- The kits run on your own Mac, but they talk to online services: always Claude (Anthropic) and, for Jarvis, Telegram. Anything else is your choice during setup, for example ElevenLabs for a natural-sounding voice. The free options (the built-in Mac voice, free local transcription) cost nothing on top of your Claude subscription. Each kit's README lists every service it uses.
 - Every kit has a Removal section at the end of its README, so you can undo it completely.
 - These kits are shared as they are, without support or warranty (see [LICENSE](LICENSE)). Read a kit's "Read This First" notes before you install it.

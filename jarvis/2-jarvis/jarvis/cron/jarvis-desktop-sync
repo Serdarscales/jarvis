@@ -1,0 +1,141 @@
+#!/bin/bash
+# jarvis-desktop-sync -- 07:30 LaunchAgent, runs before the 08:00 brief.
+#
+# You drive Jarvis by phone, but most real work happens in DESKTOP Claude Code
+# sessions. Jarvis's open queue goes stale when desktop work finishes or
+# replaces an item. This closes that gap: start from the OPEN queue items and
+# OPEN threads, derive distinctive keywords per item, keyword-grep the last
+# ~26h of session transcripts under ~/.claude/projects, read only what
+# matches, and judge per item: done on desktop / progressed / superseded /
+# no activity.
+#
+# PROPOSAL-ONLY: the worker never edits open-items.json or threads.json. The
+# morning brief reads the report and proposes closes; you confirm.
+set -eo pipefail
+CRON="$(cd "$(dirname "$0")" && pwd)"
+. "$CRON/../bin/_env.sh"
+PROJ="$HOME/.claude/projects"
+OUTDIR="$JSTATE/desktop-sync"
+LOG="$JSTATE/desktop-sync.log"
+STIMEOUT="${JARVIS_SYNC_TIMEOUT:-1200}"
+TODAY=$(date +%Y-%m-%d)
+REPORT="$OUTDIR/$TODAY.md"
+mkdir -p "$OUTDIR"
+note(){ echo "$(ts) $1" >>"$LOG"; }
+
+# --- build the worker prompt (exit 3 from python = nothing open -> skip) ---
+set +e
+PROMPT=$("$PY" - "$JSTATE" "$BRIDGE_DIR" "$PROJ" "$REPORT" "$TODAY" "$JARVIS_OWNER" "$JARVIS_WORKSPACE" <<'PYP'
+import json, sys, os
+
+jstate, bridge, proj, report, today, owner, workspace = sys.argv[1:8]
+
+def load(p, d):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return d
+
+items = [i for i in load(os.path.join(jstate, "open-items.json"), {"items": []})["items"]
+         if i.get("status") == "open"]
+threads = load(os.path.join(jstate, "threads.json"), {"threads": {}})["threads"]
+open_states = {"spawning", "working", "needs-input", "stalled", "needs-attention"}
+open_threads = [{k: t.get(k) for k in ("id", "name", "task", "status",
+                                       "last_status_line", "last_turn")}
+                for t in threads.values() if t.get("status") in open_states]
+if not items and not open_threads:
+    sys.exit(3)
+
+# exclusions: every bridge topic session (phone conversations are NOT desktop
+# work) + every thread worker session
+excl = set()
+for v in load(os.path.join(bridge, "state", "sessions.json"), {}).values():
+    sid = (v or {}).get("session_id")
+    if sid:
+        excl.add(sid)
+for t in threads.values():
+    if t.get("session_uuid"):
+        excl.add(t["session_uuid"])
+
+handovers = os.path.join(workspace, "handovers")
+handover_step = ""
+if os.path.isdir(handovers):
+    handover_step = f"""
+6. Handovers, best-effort: the workspace keeps living context per project at "{handovers}/". When a verdict is ambiguous, read the matching file there. If macOS denies access, skip it without fuss (the transcripts you already grep contain any recent edits). Tag anything you cite from a handover with its date and treat old entries as history, not current state."""
+
+last_n = 7 if handover_step else 6
+prompt = f"""You are Jarvis's desktop-sync analyst, a silent background worker. You message NO ONE and post NOTHING; your only outputs are ONE report file and stdout.
+
+CONTEXT: {owner} drives Jarvis by phone, but does most real work in desktop Claude Code sessions. Jarvis's open queue goes stale when desktop work finishes or supersedes an item. Your job: reconcile the queue against what ACTUALLY happened on desktop in the last ~26 hours.
+
+THE OPEN QUEUE (open-items.json, open entries only):
+{json.dumps(items, indent=1)}
+
+OPEN THREADS (threads.json, open states only):
+{json.dumps(open_threads, indent=1)}
+
+METHOD, follow exactly:
+1. For each item/thread above, derive 2 to 4 DISTINCTIVE search keywords: product names, file names, people, unusual terms. Never generic words like "video", "email", "task".
+2. Candidate transcripts: JSONL files under {proj} modified in the last 26 hours. Get them with: find "{proj}" -name '*.jsonl' -mmin -1560 -size +2k. EXCLUDE these session ids (Jarvis's own topics + thread workers): {json.dumps(sorted(excl))}. Also skip any transcript that is obviously a cron or worker run once you glance at it.
+3. Case-insensitive grep -l each keyword across the candidates. An item with zero hits = NO-ACTIVITY; record it and move on. Do NOT read transcripts wholesale.
+4. For hits, read only the matching regions (grep -n with context, plus the file tail for the outcome) until you can judge honestly.
+5. Verdict per item, evidence required: DONE-ON-DESKTOP (what shipped, when) | PROGRESSED (what moved, the real next step) | SUPERSEDED (the plan changed on desktop; what replaced it) | NO-ACTIVITY. No evidence = NO-ACTIVITY, never guess.{handover_step}
+{last_n}. Only as a byproduct of what you already read: if you spot a clearly NEW major workstream started on desktop that is tracked NOWHERE above, note it. Max 3 lines. Do not go fishing for these.
+
+WRITE the report to exactly this path (overwrite if it exists): {report}
+Format:
+# Desktop sync {today} (last 26h)
+## Queue reconciliation
+- <item-id> "<short hook>": <VERDICT> :: <evidence, one line> :: proposed action (close | reword to ... | keep)
+## Open threads
+- <thread-id> "<name>": <VERDICT> :: <evidence> :: proposed action
+## Spotted on desktop, untracked (max 3)
+- <one line each, or "(none)">
+## Coverage
+- <N> candidate transcripts, <M> matched and read; note anything you could not check and why.
+
+HARD RULES: proposal-only, NEVER edit open-items.json or threads.json or any other state; write ONLY the report file; no em dashes anywhere; facts with evidence only. When finished, print exactly DESKTOP_SYNC_DONE."""
+print(prompt)
+PYP
+)
+rc=$?
+set -e
+if [ "$rc" = "3" ]; then note "nothing open, skip"; echo "skip: nothing open"; exit 0; fi
+if [ "$rc" != "0" ]; then note "prompt build failed rc=$rc"; echo "error: prompt build failed"; exit 1; fi
+
+# --- spawn the worker (cwd ~/.claude, hard wall-clock timeout) ---
+note "sync worker starting (timeout ${STIMEOUT}s)"
+(
+  export USER="${USER:-$(whoami)}"; export LOGNAME="${LOGNAME:-$USER}"
+  cd "$HOME/.claude"
+  # effort high: a grep-and-judge task. Note that plain -p buffers ALL output
+  # until the end, so a killed run leaves an EMPTY worker log (= a timeout).
+  "$CLAUDE_BIN" -p "$PROMPT" --model "$JARVIS_MODEL" --effort high --strict-mcp-config \
+    --setting-sources project --dangerously-skip-permissions \
+    >"$JSTATE/.desktop-sync-worker.log" 2>&1 &
+  wpid=$!
+  (
+    wstart=$(date +%s)
+    while kill -0 "$wpid" 2>/dev/null; do
+      if [ $(( $(date +%s) - wstart )) -ge "$STIMEOUT" ]; then
+        kill "$wpid" 2>/dev/null
+        sleep 10
+        kill -9 "$wpid" 2>/dev/null
+        break
+      fi
+      sleep 15
+    done
+  ) & killer=$!
+  wait "$wpid" 2>/dev/null; rc=$?
+  kill "$killer" 2>/dev/null || true
+  exit "$rc"
+) && note "sync done -> $REPORT" || note "worker ended early (timeout ${STIMEOUT}s or error); partial report may exist"
+
+# --- retention: keep the last 14 reports ---
+ls -t "$OUTDIR"/*.md 2>/dev/null | tail -n +15 | xargs rm -f 2>/dev/null || true
+if [ -f "$REPORT" ]; then
+  echo "desktop-sync complete -> $REPORT"
+else
+  echo "desktop-sync FAILED: no report written for $TODAY (see $LOG)"
+  exit 1
+fi

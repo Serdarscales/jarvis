@@ -1,0 +1,199 @@
+#!/bin/bash
+# jarvis-handover [reason]  -- 03:00 LaunchAgent ("nightly") and jarvis-watch ("threshold-N").
+# Consolidates the Jarvis conversation into journal.md, then resets the topic's
+# bridge session so the next turn starts lean and gets re-primed (persona +
+# standing orders + journal tail). Posts nothing to the topic.
+# Safety gates: bridge idle, no running workers or thread turns, bridge runs
+# its current code (deploy guard), and a hard timeout on the journal writer.
+# The session is reset only when the journal writer exited 0 AND the journal
+# changed. Otherwise (failure, timeout, or a write followed by either) it is
+# NOT reset and the script exits 1, so the next run retries the wrap.
+set -eo pipefail
+CRON="$(cd "$(dirname "$0")" && pwd)"
+. "$CRON/../bin/_env.sh"
+require_topic
+TOPIC="$JARVIS_TOPIC_ID"
+JOURNAL="$JSTATE/journal.md"
+LOG="$JSTATE/handover.log"
+# The journal writer's hard limit. Its prompt keeps it scoped (see HARD SCOPE
+# RULES below); without them it drifted into reading everything and got killed.
+JTIMEOUT="${JARVIS_JOURNALER_TIMEOUT:-600}"
+REASON="${1:-manual}"
+mkdir -p "$JSTATE"
+note(){ echo "$(ts) [$REASON] $1" >>"$LOG"; }
+
+# nightly run also prunes growth
+if [ "$REASON" = "nightly" ]; then bash "$CRON/jarvis-prune" >>"$LOG" 2>&1 || true; fi
+
+# --- safety gate ---
+# Busy = any bridge child process EXCEPT the permanent
+# multiprocessing.resource_tracker helper the bridge starts at boot.
+# Fail-safe: any other or unreadable child counts as busy.
+busy_child(){ # busy_child <pid>: rc 0 + prints the blocking command if busy; rc 1 if idle
+  local pid cmd
+  for pid in $(pgrep -P "$1" 2>/dev/null || true); do
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    if [ -z "$cmd" ]; then
+      kill -0 "$pid" 2>/dev/null || continue
+      cmd="(unreadable command, pid $pid)"
+    fi
+    case "$cmd" in
+      *multiprocessing.resource_tracker*) continue ;;
+      *) printf '%.80s' "$cmd"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Nightly retries the gate (12 x 10 min, ~2h) and drops ONE failure alert if it
+# never clears. Threshold/manual runs are single-shot (jarvis-watch re-fires).
+if [ "$REASON" = "nightly" ]; then
+  MAX_ATTEMPTS="${JARVIS_HANDOVER_MAX_ATTEMPTS:-12}"; RETRY_SLEEP="${JARVIS_HANDOVER_RETRY_SLEEP:-600}"
+else
+  MAX_ATTEMPTS=1; RETRY_SLEEP=0
+fi
+ATTEMPT=1
+while :; do
+  UNSAFE=""
+  BPID=$(pgrep -f "$BRIDGE_DIR/bridge.py" 2>/dev/null | head -1 || true)
+  if [ -z "$BPID" ]; then
+    UNSAFE="bridge down"
+  elif BLOCKER=$(busy_child "$BPID"); then
+    UNSAFE="bridge mid-turn (child: $BLOCKER)"
+  else
+    RUNNING=$("$PY" -c "import json,sys;print(sum(1 for j in json.load(open(sys.argv[1])).get('jobs',[]) if j.get('status')=='running'))" "$JSTATE/jobs.json" 2>/dev/null || echo 0)
+    if [ "${RUNNING:-0}" -ne 0 ]; then
+      UNSAFE="$RUNNING worker(s) running"
+    else
+      LIVET=$("$PY" -c "import sys;sys.path.insert(0,sys.argv[1]);import _threadcore;print(len(_threadcore.live_turns(sys.argv[2])))" "$CRON" "$JSTATE" 2>/dev/null || echo 0)
+      [ "${LIVET:-0}" -eq 0 ] || UNSAFE="$LIVET live thread turn(s)"
+    fi
+  fi
+  [ -z "$UNSAFE" ] && break
+  note "$UNSAFE, defer (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+  if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+    if [ "$REASON" = "nightly" ]; then
+      "$PY" - "$TRIGGER_DIR" "$TOPIC" "$MAX_ATTEMPTS" "$UNSAFE" "$JARVIS_OWNER" <<'PYA' && note "nightly gate exhausted; failure alert trigger dropped" || note "nightly gate exhausted; FAILED to write alert trigger"
+import json, os, sys, time
+trig_dir, topic, attempts, unsafe, owner = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+prompt = ("You are Jarvis (read your persona if you lack context). This is a background trigger, NOT a "
+          f"message from {owner}, so do not repeat it back. Tonight's nightly context wrap FAILED: the "
+          f"safety gate never reported idle across {attempts} attempts. "
+          f"Last blocker: {unsafe}. The session was NOT consolidated or reset, so context keeps growing. "
+          f"Tell {owner} DIRECTLY in your own voice (text + jarvis-say): a short honest heads up that the "
+          "wrap failed and what blocked it. No em dashes.")
+os.makedirs(trig_dir, exist_ok=True)
+p = os.path.join(trig_dir, f"jarvis-handover-fail-{int(time.time())}.json")
+json.dump({"topic_id": topic, "prompt": prompt, "sender": "jarvis-handover"}, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+PYA
+      echo "fail: nightly gate exhausted ($UNSAFE)"
+    else
+      echo "defer: $UNSAFE"
+    fi
+    exit 0
+  fi
+  ATTEMPT=$((ATTEMPT+1))
+  sleep "$RETRY_SLEEP"
+done
+
+# --- resolve the current Jarvis session transcript (any project dir) ---
+SID=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],{}).get('session_id',''))" "$BRIDGE_DIR/state/sessions.json" "$TOPIC" 2>/dev/null || echo "")
+TRANSCRIPT=""
+if [ -n "$SID" ]; then
+  TRANSCRIPT=$(ls "$HOME"/.claude/projects/*/"$SID".jsonl 2>/dev/null | head -1 || true)
+fi
+if [ -z "$TRANSCRIPT" ]; then note "no transcript ($SID); reset only"; fi
+
+# --- journaler (headless claude, wall-clock hard timeout) ---
+if [ -n "$TRANSCRIPT" ]; then
+  HDR="## $(date '+%Y-%m-%d %H:%M') wrap [$REASON]"
+  JPROMPT="You maintain Jarvis's memory journal. Append a concise dated wrap so a fresh Jarvis, with ONLY the journal plus jobs.json plus open-items.json, knows exactly where everything stands and can continue seamlessly.
+HARD SCOPE RULES (you run under a ${JTIMEOUT}s kill timer; runs that ignore these get killed mid-run and the night's journal is LOST):
+- Read ONLY: the END of the transcript below, the TAIL of the journal (last ~150 lines, just to avoid repeating), open-items.json, jobs.json.
+- Do NOT read any other transcript or session file. Do NOT run find or grep across $HOME/.claude/projects. Do NOT read desktop-sync reports or run git log anywhere. Cross-checking is the desktop-sync worker's job, not yours.
+- Append EARLY: write the journal section as soon as you have the gist. A good-enough wrap that lands beats a perfect one that gets killed.
+1. Read the END of the Jarvis transcript at: $TRANSCRIPT  (JSONL; recent turns only, roughly the last day).
+2. Read the TAIL of $JOURNAL (last ~150 lines) so you do not repeat what is already captured.
+3. Read $JSTATE/open-items.json and $JSTATE/jobs.json for live state.
+4. Append ONE section to the BOTTOM of $JOURNAL with header: $HDR  -- only what is NEW since the last entry (decisions, live threads and their state, what $JARVIS_OWNER is mid-way through). Concise but complete. No em dashes.
+Write ONLY to the journal. Do not message anyone. When finished print JOURNAL_UPDATED."
+  touch "$JOURNAL"
+  JSIG_BEFORE=$(stat -f "%m:%z" "$JOURNAL" 2>/dev/null || echo 0)
+  rm -f "$JSTATE/.journaler-timeout-fired"
+  jrc=0
+  (
+    export USER="${USER:-$(whoami)}"; export LOGNAME="${LOGNAME:-$USER}"
+    cd "$HOME/.claude"
+    "$CLAUDE_BIN" -p "$JPROMPT" --model "$JARVIS_MODEL" --strict-mcp-config --setting-sources project --dangerously-skip-permissions >"$JSTATE/.handover-journaler.log" 2>&1 &
+    jpid=$!
+    # Wall-clock watchdog in 15s slices (a single `sleep N` pauses during Mac sleep).
+    (
+      wstart=$(date +%s)
+      while kill -0 "$jpid" 2>/dev/null; do
+        if [ $(( $(date +%s) - wstart )) -ge "$JTIMEOUT" ]; then
+          : > "$JSTATE/.journaler-timeout-fired"
+          kill "$jpid" 2>/dev/null
+          sleep 10
+          kill -9 "$jpid" 2>/dev/null
+          break
+        fi
+        sleep 15
+      done
+    ) & killer=$!
+    wait "$jpid" 2>/dev/null; rc=$?
+    kill "$killer" 2>/dev/null || true
+    exit "$rc"
+  ) || jrc=$?
+  # Honest outcome: "journal updated" only if the file actually changed
+  # (mtime + size, so a write within the same second still counts).
+  JSIG_AFTER=$(stat -f "%m:%z" "$JOURNAL" 2>/dev/null || echo 0)
+  TIMED_OUT=0
+  [ -f "$JSTATE/.journaler-timeout-fired" ] && { TIMED_OUT=1; rm -f "$JSTATE/.journaler-timeout-fired"; }
+  # Reset only after a CLEAN wrap: the writer exited 0 AND the journal changed.
+  # A write followed by a failure or timeout may be a half-finished entry.
+  if [ "$JSIG_AFTER" != "$JSIG_BEFORE" ] && [ "$jrc" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ]; then
+    note "journal updated"
+  else
+    if [ "$JSIG_AFTER" != "$JSIG_BEFORE" ]; then
+      note "journal changed but the writer did not finish cleanly (rc=$jrc, timed out=$TIMED_OUT); the entry may be partial; log tail: $(tail -c 250 "$JSTATE/.handover-journaler.log" 2>/dev/null | tr '\n' ' ')"
+    elif [ "$TIMED_OUT" -eq 1 ]; then
+      note "journaler KILLED at ${JTIMEOUT}s wall-clock (rc=$jrc), journal NOT updated; log tail: $(tail -c 250 "$JSTATE/.handover-journaler.log" 2>/dev/null | tr '\n' ' ')"
+    else
+      note "journaler failed (rc=$jrc), journal NOT updated; log tail: $(tail -c 250 "$JSTATE/.handover-journaler.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+    # Never reset a conversation whose memory was not saved: the session stays
+    # as it is, and the next watch (or nightly) run tries the wrap again.
+    note "session NOT reset (no clean journal update); next run retries"
+    echo "fail: no clean journal update, session kept"
+    exit 1
+  fi
+fi
+
+# --- re-check idle ---
+if BLOCKER=$(busy_child "$BPID"); then note "became busy during journaling, defer reset (child: $BLOCKER)"; echo "defer reset: busy"; exit 0; fi
+
+# --- deploy guard: only reset if the bridge runs its CURRENT code (the Jarvis
+#     patch must be live, or the fresh session would start without the persona).
+#     Fails SAFE (defer) when the start time is unknown. ---
+BSTART=$(ps -o lstart= -p "$BPID" 2>/dev/null | LC_ALL=C "$PY" -c "import sys,datetime
+s=' '.join(sys.stdin.read().split())
+print(int(datetime.datetime.strptime(s,'%a %b %d %H:%M:%S %Y').timestamp()) if s else 0)" 2>/dev/null || echo 0)
+BMTIME=$(stat -f %m "$BRIDGE_DIR/bridge.py" 2>/dev/null || echo 9999999999)
+if [ "${BSTART:-0}" -lt "${BMTIME:-9999999999}" ]; then
+  note "journal written; reset DEFERRED (bridge.py changed since the bridge started: restart the bridge)"
+  echo "reset deferred (bridge restart pending)"; exit 0
+fi
+
+# --- reset the topic's session + its token usage ---
+for F in sessions.json token_usage.json; do
+  "$PY" - "$BRIDGE_DIR/state/$F" "$TOPIC" <<'PYR'
+import json, sys, os
+p, t = sys.argv[1], str(sys.argv[2])
+try: d = json.load(open(p))
+except Exception: d = {}
+d.pop(t, None); tmp = f"{p}.tmp.{os.getpid()}"; json.dump(d, open(tmp, "w"), indent=2); os.replace(tmp, p)
+PYR
+done
+note "session reset, lean + primed next turn"
+echo "handover complete ($REASON)"

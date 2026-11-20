@@ -1,0 +1,144 @@
+#!/bin/bash
+# jarvis-selftest [--live] [--keep]
+#
+# Offline (default): checks the config, then runs the state helper, the
+# one-shot worker path and the threads engine against a SCRATCH state dir with
+# FAKE workers. Touches no live state, posts nothing, costs nothing.
+# --live: also sends one real voice note and one text into the Jarvis topic
+#         (proves the TTS engine, ffmpeg and the Telegram credentials).
+# --keep: keep the scratch dir for inspection.
+set -uo pipefail
+BIN="$(cd "$(dirname "$0")" && pwd)"
+. "$BIN/_env.sh"
+LIVE=0; KEEP=0
+for a in "$@"; do case "$a" in --live) LIVE=1 ;; --keep) KEEP=1 ;; esac; done
+
+PASS=0; FAIL=0; WARN=0
+ok(){ echo "  PASS  $1"; PASS=$((PASS+1)); }
+bad(){ echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
+warn(){ echo "  WARN  $1"; WARN=$((WARN+1)); }
+wait_for(){ # wait_for <seconds> <command...>: poll until the command succeeds
+  local n=$(( $1 * 2 )); shift
+  while [ $n -gt 0 ]; do "$@" >/dev/null 2>&1 && return 0; sleep 0.5; n=$((n-1)); done
+  return 1
+}
+
+echo "Jarvis self-test (JARVIS_HOME=$JARVIS_HOME)"
+echo "Config:"
+REAL_TOPIC="${JARVIS_TOPIC_ID:-}"
+[ -f "$JARVIS_HOME/jarvis.env" ] && ok "jarvis.env present" || bad "jarvis.env missing (copy jarvis.env.example)"
+[ -n "$REAL_TOPIC" ] && ok "JARVIS_TOPIC_ID set ($REAL_TOPIC)" || warn "JARVIS_TOPIC_ID not set yet (needed before going live)"
+[ "$JARVIS_OWNER" != "the user" ] && ok "JARVIS_OWNER set ($JARVIS_OWNER)" || warn "JARVIS_OWNER not set"
+[ -x "$CLAUDE_BIN" ] && ok "claude CLI at $CLAUDE_BIN" || bad "claude CLI not found at $CLAUDE_BIN (set CLAUDE_BIN)"
+[ -n "$FFMPEG" ] && ok "ffmpeg at $FFMPEG" || bad "ffmpeg missing (brew install ffmpeg)"
+[ -d "$JARVIS_WORKSPACE" ] && ok "workspace $JARVIS_WORKSPACE" || bad "JARVIS_WORKSPACE does not exist: $JARVIS_WORKSPACE"
+if [ -f "$BRIDGE_ENV" ]; then
+  [ -n "$(bridge_cred TELEGRAM_BOT_TOKEN)" ] && ok "bridge .env has TELEGRAM_BOT_TOKEN" || bad "bridge .env has no TELEGRAM_BOT_TOKEN"
+  [ -n "$(bridge_cred TELEGRAM_GROUP_ID)" ] && ok "bridge .env has TELEGRAM_GROUP_ID" || bad "bridge .env has no TELEGRAM_GROUP_ID"
+else
+  bad "bridge .env not found at $BRIDGE_ENV (set BRIDGE_DIR)"
+fi
+if grep -q "{{OWNER}}" "$JARVIS_HOME/jarvis-prompt.md" "$JSTATE/standing-orders.md" 2>/dev/null; then
+  bad "{{OWNER}} placeholder still in jarvis-prompt.md or standing-orders.md"
+else
+  ok "persona and standing orders personalized"
+fi
+if [ -f "$BRIDGE_DIR/bridge.py" ]; then
+  grep -q "def cmd_jarvis(" "$BRIDGE_DIR/bridge.py" && ok "bridge.py has the Jarvis patch" || warn "bridge.py not patched yet (bridge-patch/patch_bridge.py)"
+fi
+case "${JARVIS_TTS:-say}" in
+  elevenlabs) [ -n "${ELEVENLABS_API_KEY:-}" ] && [ -n "${ELEVENLABS_VOICE_ID:-}" ] && ok "ElevenLabs key + voice set" || bad "JARVIS_TTS=elevenlabs but key or voice id missing" ;;
+  openai) [ -n "${OPENAI_API_KEY:-}" ] && ok "OpenAI key set" || bad "JARVIS_TTS=openai but OPENAI_API_KEY missing" ;;
+  *) ok "TTS engine: macOS say (free)" ;;
+esac
+
+# ---------------------------------------------------------------- engine (offline)
+T=$(mktemp -d "${TMPDIR:-/tmp}/jarvis-selftest.XXXXXX")
+export JARVIS_STATE_DIR="$T/state"
+export JARVIS_TOPIC_ID="${REAL_TOPIC:-1}"
+export JARVIS_AUTOCONTINUE=0
+mkdir -p "$JARVIS_STATE_DIR"
+TRIG="$JARVIS_STATE_DIR/triggers"
+
+# fake claude CLI: writes a result into the output file named in the prompt
+cat > "$T/fake-claude" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = "--version" ]; then echo "0.0.0 (selftest fake)"; exit 0; fi
+out=$(printf '%s' "$2" | grep -o 'to this exact file: [^ ]*' | head -1 | sed 's/to this exact file: //')
+[ -n "$out" ] && printf 'selftest worker did the thing\nbody line\n' > "$out"
+exit 0
+EOF
+# fake thread worker: one stream-json result event with a status marker
+cat > "$T/fake-thread" <<'EOF'
+#!/bin/bash
+/usr/bin/python3 -c 'import json,os; print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"Selftest turn.\n[[THREAD-STATUS: %s]] selftest %s" % (os.environ.get("FAKE_STATUS","DONE"), os.environ.get("FAKE_STATUS","DONE").lower()),"usage":{"input_tokens":10,"output_tokens":5}}))'
+EOF
+chmod +x "$T/fake-claude" "$T/fake-thread"
+export CLAUDE_BIN="$T/fake-claude"
+export JARVIS_FAKE_WORKER="bash $T/fake-thread"
+
+echo "Engine (offline, scratch state, fake workers):"
+ID=$("$PY" "$BIN/_state.py" add_open_item note manual "selftest item" 2>&1)
+case "$ID" in item-*) ok "queue: add_open_item" ;; *) bad "queue: add_open_item ($ID)" ;; esac
+"$PY" "$BIN/_state.py" status | grep -q "selftest item" && ok "queue: status lists it" || bad "queue: status"
+"$PY" "$BIN/_state.py" resolve_item "$ID" >/dev/null && ok "queue: resolve_item" || bad "queue: resolve_item"
+
+JOB=$(bash "$BIN/jarvis-spawn" "selftest task" 2>&1)
+case "$JOB" in job-*) ok "spawn: job registered ($JOB)" ;; *) bad "spawn: $JOB" ;; esac
+if wait_for 30 bash -c "ls '$TRIG'/jarvis-$JOB-*.json"; then
+  ok "spawn: worker finished and dropped a completion trigger"
+  grep -q '"status": "done"' "$JARVIS_STATE_DIR/jobs.json" && ok "spawn: job marked done" || bad "spawn: job not marked done"
+  grep -q "selftest worker did the thing" "$TRIG"/jarvis-$JOB-*.json && ok "spawn: summary carried into the trigger" || bad "spawn: summary missing from trigger"
+else
+  bad "spawn: no completion trigger within 30s"
+fi
+
+TID=$(bash "$BIN/jarvis-thread-new" "selftest" "say hi" 2>&1)
+case "$TID" in th-*) ok "thread: created ($TID)" ;; *) bad "thread: new ($TID)" ;; esac
+thread_status(){ "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['threads'][sys.argv[2]]['status'])" "$JARVIS_STATE_DIR/threads.json" "$TID" 2>/dev/null; }
+if wait_for 30 bash -c "[ \"\$($PY -c \"import json;print(json.load(open('$JARVIS_STATE_DIR/threads.json'))['threads']['$TID']['status'])\")\" = done ]"; then
+  ok "thread: turn 1 committed DONE"
+else
+  bad "thread: turn 1 did not commit (status $(thread_status)); see $JARVIS_STATE_DIR/threads/$TID.run.log"
+fi
+grep -q "$TID" "$JARVIS_STATE_DIR/pending-pings.json" 2>/dev/null && ok "thread: completion ping queued" || bad "thread: no pending ping"
+N=$("$PY" -c "import sys;sys.path.insert(0,sys.argv[1]);import _threadcore as c;print(c.flush_pending_pings(c.trigger_dir(),debounce_s=0))" "$JARVIS_HOME/cron" 2>&1)
+[ "$N" = "1" ] && ok "thread: coalescer drained 1 ping into a trigger" || bad "thread: coalescer returned $N"
+CO=$(ls "$TRIG"/jarvis-threads-coalesced-*.json 2>/dev/null | head -1)
+if [ -n "$CO" ] && ! grep -q "{OWNER}" "$CO"; then ok "thread: trigger prompt personalized"; else bad "thread: coalesced trigger missing or has {OWNER}"; fi
+
+FAKE_STATUS=NEEDS-INPUT bash "$BIN/jarvis-thread-tell" "$TID" "second turn please" >/dev/null 2>&1
+if wait_for 30 bash -c "[ \"\$($PY -c \"import json;print(json.load(open('$JARVIS_STATE_DIR/threads.json'))['threads']['$TID']['status'])\")\" = needs-input ]"; then
+  ok "thread: tell resumed it (turn 2 = needs-input)"
+else
+  bad "thread: tell did not run turn 2 (status $(thread_status))"
+fi
+grep -q "\"ref\": \"$TID\"" "$JARVIS_STATE_DIR/open-items.json" && ok "thread: needs-input put a pointer in the queue" || bad "thread: no queue pointer"
+bash "$BIN/jarvis-thread-kill" "$TID" "selftest" >/dev/null 2>&1
+[ "$(thread_status)" = "killed" ] && ok "thread: kill sticks" || bad "thread: kill (status $(thread_status))"
+
+"$PY" "$JARVIS_HOME/cron/_threadcron.py" reconcile >/dev/null 2>&1 && ok "cron: reconcile runs" || bad "cron: reconcile"
+"$PY" "$JARVIS_HOME/cron/_threadcron.py" watch_sweep "$TRIG" "$JARVIS_TOPIC_ID" >/dev/null 2>&1 && ok "cron: watch sweep runs" || bad "cron: watch sweep"
+"$PY" "$JARVIS_HOME/cron/_threadcron.py" prune >/dev/null 2>&1 && ok "cron: prune runs" || bad "cron: prune"
+BAD_JSON=0
+for f in "$TRIG"/*.json; do "$PY" -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['topic_id'] and d['prompt']" "$f" 2>/dev/null || BAD_JSON=1; done
+[ "$BAD_JSON" = 0 ] && ok "triggers: every trigger file is valid JSON with topic + prompt" || bad "triggers: malformed trigger file"
+
+if [ "$KEEP" = 1 ]; then echo "  (scratch kept at $T)"; else rm -rf "$T"; fi
+unset JARVIS_STATE_DIR JARVIS_FAKE_WORKER JARVIS_AUTOCONTINUE CLAUDE_BIN
+
+# ---------------------------------------------------------------- live (opt-in)
+if [ "$LIVE" = 1 ]; then
+  echo "Live (posts into the Jarvis topic):"
+  if [ -z "$REAL_TOPIC" ]; then
+    bad "live: JARVIS_TOPIC_ID not set"
+  else
+    export JARVIS_TOPIC_ID="$REAL_TOPIC"
+    OUT=$(bash "$BIN/jarvis-say" "Jarvis self test. If you can hear this, my voice works." 2>&1) && ok "live: voice note sent (${OUT##*engine=}" || bad "live: jarvis-say: $OUT"
+    OUT=$(bash "$BIN/jarvis-send-text" "Jarvis self test: text delivery works." 2>&1) && ok "live: text sent" || bad "live: jarvis-send-text: $OUT"
+  fi
+fi
+
+echo
+echo "RESULT: $PASS passed, $FAIL failed, $WARN warnings"
+[ "$FAIL" = 0 ]

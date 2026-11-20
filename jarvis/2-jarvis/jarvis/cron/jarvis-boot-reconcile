@@ -1,0 +1,15 @@
+#!/bin/bash
+# jarvis-boot-reconcile -- RunAtLoad LaunchAgent. On login/boot: repair
+# in-flight thread drift and drop a Jarvis-topic trigger so the conductor
+# re-acquires its open threads right away instead of waiting for the 08:00 brief.
+set -eo pipefail
+CRON="$(cd "$(dirname "$0")" && pwd)"
+. "$CRON/../bin/_env.sh"
+require_topic
+mkdir -p "$JSTATE"
+LOG="$JSTATE/cron-bootreconcile.out"
+
+echo "$(ts) boot-reconcile start" >>"$LOG"
+"$PY" "$CRON/_threadcron.py" reconcile >>"$LOG" 2>&1 || true
+"$PY" "$CRON/_threadcron.py" drop_reorient "$TRIGGER_DIR" "$JARVIS_TOPIC_ID" >>"$LOG" 2>&1 || true
+echo "$(ts) boot-reconcile done" >>"$LOG"

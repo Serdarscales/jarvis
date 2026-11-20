@@ -1,0 +1,33 @@
+#!/bin/bash
+# jarvis-send-file <path> [caption]
+# Sends a real file into the Jarvis topic. Images -> sendPhoto, everything else -> sendDocument.
+set -eo pipefail
+. "$(dirname "$0")/_env.sh"
+require_topic
+CURL="/usr/bin/curl"
+
+FILE="${1:?usage: jarvis-send-file <path> [caption]}"
+CAPTION="${2:-}"
+[ -f "$FILE" ] || { echo "jarvis-send-file: no such file: $FILE" >&2; exit 1; }
+
+TOKEN=$(bridge_cred TELEGRAM_BOT_TOKEN)
+GROUP=$(bridge_cred TELEGRAM_GROUP_ID)
+
+ext=$(printf '%s' "${FILE##*.}" | tr 'A-Z' 'a-z')
+case "$ext" in
+  jpg|jpeg|png|webp|gif|bmp) METHOD="sendPhoto"; FIELD="photo" ;;
+  *)                         METHOD="sendDocument"; FIELD="document" ;;
+esac
+
+RESP="/tmp/jarvis-sendfile-$$.json"
+HTTP=$("$CURL" -sS -o "$RESP" -w "%{http_code}" \
+  "https://api.telegram.org/bot${TOKEN}/${METHOD}" \
+  -F "chat_id=${GROUP}" -F "message_thread_id=${JARVIS_TOPIC_ID}" \
+  -F "${FIELD}=@${FILE}" -F "caption=${CAPTION}")
+
+if [ "$HTTP" != "200" ]; then
+  echo "jarvis-send-file: $METHOD failed http=$HTTP $(cat "$RESP" 2>/dev/null)" >&2
+  rm -f "$RESP"; exit 1
+fi
+rm -f "$RESP"
+echo "jarvis-send-file: ok ($METHOD, topic=$JARVIS_TOPIC_ID, $(basename "$FILE"))"

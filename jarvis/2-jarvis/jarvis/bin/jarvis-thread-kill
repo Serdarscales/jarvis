@@ -1,0 +1,21 @@
+#!/bin/bash
+# jarvis-thread-kill <thread_id> ["note"]
+# Human-override KILL: actually stop the thread's live worker (killpg the
+# recorded process group), mark it status=killed + closed_by_human, and
+# resolve its open-item pointers. A late commit from the dying turn is kept
+# for the record but can NEVER re-open the thread. "Close it" without killing
+# a live worker = jarvis-thread-done. A later explicit jarvis-thread-tell
+# re-opens the thread on purpose.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY=/usr/bin/python3
+
+ID="${1:?usage: jarvis-thread-kill <thread_id> [note]}"
+NOTE="${2:-killed by owner}"
+
+if [ "${JARVIS_WORKER:-}" = "1" ]; then
+  echo "ERROR: a worker cannot kill threads (JARVIS_WORKER=1)" >&2
+  exit 3
+fi
+
+exec "$PY" "$DIR/_threadlib.py" kill "$ID" "$NOTE"

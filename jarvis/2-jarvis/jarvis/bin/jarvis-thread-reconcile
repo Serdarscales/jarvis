@@ -1,0 +1,8 @@
+#!/bin/bash
+# jarvis-thread-reconcile -- single-flight, pid-gated drift repair + slot reap.
+# Safe to run on boot / from the watcher; never repairs a live worker.
+# Delegates to the cron-side lib so there is ONE reconcile implementation shared
+# by the conductor and the LaunchAgents. Honors JARVIS_STATE_DIR for isolated tests.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec /usr/bin/python3 "$DIR/../cron/_threadcron.py" reconcile "$@"

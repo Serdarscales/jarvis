@@ -1,0 +1,13 @@
+#!/bin/bash
+# jarvis-thread-run <thread_id> [--first] [--auto] "<input>"
+# (--auto marks an engine-fired autocontinue turn; see _threadlib.run_turn)
+# Run ONE turn for a thread in the FOREGROUND (blocking). Holds the per-thread
+# flock + a governor slot for the whole turn, so concurrent runs of the same
+# thread are refused (no JSONL braiding) and the simultaneous-running cap holds.
+# Prints the result on one line:
+#   BUSY | QUEUED | NOTHREAD | DUP | done | needs-input | working | needs-attention
+# The conductor never calls this directly in the foreground; the new/tell
+# wrappers background it. Tests call it directly to exercise the flock/governor.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec /usr/bin/python3 "$DIR/_threadlib.py" run "$@"

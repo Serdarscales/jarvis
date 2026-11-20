@@ -1,0 +1,36 @@
+#!/bin/bash
+# jarvis-notify "<one-line summary>" "<job-id>"
+# Marks the job done, adds an open-items entry, and drops a trigger into the
+# bridge so the Jarvis session wakes up and decides whether to ping the owner.
+set -eo pipefail
+. "$(dirname "$0")/_env.sh"
+require_topic
+
+SUMMARY="${1:?usage: jarvis-notify <summary> <job-id>}"
+JOB_ID="${2:-unknown}"
+
+"$PY" "$JARVIS_HOME/bin/_state.py" complete_job "$JOB_ID" "$SUMMARY" >/dev/null
+"$PY" "$JARVIS_HOME/bin/_state.py" add_open_item "worker" "$JOB_ID" "$SUMMARY" >/dev/null
+
+mkdir -p "$TRIGGER_DIR"
+TRIG="$TRIGGER_DIR/jarvis-${JOB_ID}-$(date +%s).json"
+"$PY" - "$JARVIS_TOPIC_ID" "$JOB_ID" "$SUMMARY" "$TRIG" "$JARVIS_HOME" "$JSTATE" "$JARVIS_OWNER" <<'PY'
+import json, os, sys
+topic, job, summary, trig, home, state, owner = sys.argv[1:8]
+prompt = (
+    f"You are Jarvis (read your persona/operating manual at {home}/jarvis-prompt.md "
+    "if you lack context). "
+    f"This is a background trigger, NOT a message from {owner}, so do not repeat it back. "
+    f"A worker just finished [{job}]: {summary}. "
+    f"Its full output is at {state}/outputs/{job}.md . "
+    f"If it is worth surfacing now, talk to {owner} DIRECTLY in your own voice (a short text update "
+    "plus jarvis-say); if they seem mid-flow on something else, just park it in the open-items queue "
+    "instead. Second person, casual, lead with the point, no em dashes."
+)
+# Atomic: '.json.tmp' never matches the bridge watcher's *.json glob, so a
+# half-written trigger can never be read as malformed and deleted.
+json.dump({"topic_id": int(topic), "prompt": prompt, "sender": "jarvis-worker"}, open(trig + ".tmp", "w"))
+os.replace(trig + ".tmp", trig)
+PY
+
+echo "jarvis-notify: queued completion for $JOB_ID (topic $JARVIS_TOPIC_ID)"

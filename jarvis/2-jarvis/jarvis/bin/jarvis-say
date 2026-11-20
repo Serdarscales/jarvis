@@ -1,0 +1,244 @@
+#!/bin/bash
+# jarvis-say "<text>"  (or pipe text on stdin)
+# TTS the text and post it as ONE Telegram VOICE NOTE into the Jarvis topic.
+# Engine from JARVIS_TTS (elevenlabs|openai|say), default say. The bot token is
+# read live from the bridge .env (single source, never duplicated here).
+#
+# One note per reply: long text is still sent to the TTS engine in
+# sentence-boundary chunks (<= JARVIS_SAY_MAXC chars each, with
+# previous_text/next_text so ElevenLabs keeps the voice continuous), but the
+# audio is MERGED into a single file before it is posted. Each chunk's duration
+# is checked against its length and regenerated once if it came back short.
+# The only real cap is Telegram's: a voice note must be <= 1 MB or Telegram
+# delivers it as an audio FILE instead. So the Opus bitrate scales down with
+# duration (48k .. 14k), and only a reply longer than about 9 minutes of speech
+# becomes 2+ notes.
+#
+# Voice last: inside a bridge turn the bridge sets JARVIS_VOICE_DEFER_DIR. The
+# audio is still made right away, but parked there, and the bridge posts it
+# right AFTER the text reply, so the voice note is always the last message.
+set -eo pipefail
+. "$(dirname "$0")/_env.sh"
+require_topic
+SAY="/usr/bin/say"
+CURL="/usr/bin/curl"
+mkdir -p "$JSTATE"
+LOG="$JSTATE/jarvis-say.log"
+
+TEXT="${1:-$(cat)}"
+if [ -z "${TEXT//[[:space:]]/}" ]; then echo "jarvis-say: empty text" >&2; exit 1; fi
+if [ -z "$FFMPEG" ]; then echo "jarvis-say: ffmpeg not found (brew install ffmpeg)" >&2; exit 1; fi
+
+MAXC="${JARVIS_SAY_MAXC:-2500}"                 # TTS request size, NOT a delivery split (notes are merged)
+NOTE_BYTES="${JARVIS_SAY_NOTE_BYTES:-900000}"   # Telegram: voice notes over 1 MB arrive as files (Opus can land a few % over target)
+LIMIT="${JARVIS_SAY_LIMIT_BYTES:-1000000}"   # Telegram's hard voice-note limit; NOTE_BYTES is the target below it
+[ "$NOTE_BYTES" -gt $(( LIMIT * 9 / 10 )) ] && NOTE_BYTES=$(( LIMIT * 9 / 10 ))   # grouping follows a lowered limit
+[ "$MAXC" -gt 5000 ] && MAXC=5000   # one chunk always fits one note
+MIN_KBPS=14; MAX_KBPS=48
+MAX_NOTE_SEC=$(( NOTE_BYTES * 8 / (MIN_KBPS * 1000) ))  # about 548 s at 14 kbps
+
+ENGINE="${JARVIS_TTS:-say}"   # a JARVIS_TTS in the caller's environment wins over jarvis.env (_env.sh)
+TOKEN=$(bridge_cred TELEGRAM_BOT_TOKEN)
+GROUP=$(bridge_cred TELEGRAM_GROUP_ID)
+# JARVIS_SAY_TOPIC lets another persona on the bridge reuse this same TTS path.
+TOPIC="${JARVIS_SAY_TOPIC:-$JARVIS_TOPIC_ID}"
+[ -n "$TOKEN" ] && [ -n "$GROUP" ] || { echo "jarvis-say: TELEGRAM_BOT_TOKEN / TELEGRAM_GROUP_ID missing in $BRIDGE_ENV" >&2; exit 1; }
+
+DEFER="${JARVIS_VOICE_DEFER_DIR:-}"
+STOP_MARK=""; [ -n "$DEFER" ] && STOP_MARK="$DEFER.discarded"
+# The user already pressed Stop on the turn that started us: say nothing.
+if [ -n "$STOP_MARK" ] && [ -d "$STOP_MARK" ]; then
+  echo "$(ts) dropped voice (turn was stopped) chars=${#TEXT}" >> "$LOG"
+  echo "jarvis-say: turn was stopped, voice note dropped"; exit 0
+fi
+
+P=$$
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/jarvis-say.XXXXXX")"
+# The notes are built in a batch folder next to the holding folder, so parking
+# the whole reply is ONE atomic rename (all notes, or none, go to the bridge).
+if [ -n "$DEFER" ] && [ -d "$DEFER" ]; then OUTDIR="$(dirname "$DEFER")"; else DEFER=""; OUTDIR="$WORK"; fi
+BATCH="$OUTDIR/.jarvis-say-batch-$P-$RANDOM"
+trap 'rm -rf "$WORK" "$BATCH"' EXIT
+trap 'exit 130' INT TERM HUP   # run the EXIT cleanup on interrupts too
+mkdir -p "$BATCH"
+
+# --- 1. chunk the text at sentence boundaries (each <= MAXC chars) -------------
+"$PY" - "$TEXT" "$MAXC" "$WORK" <<'EOF'
+import re,sys
+t=sys.argv[1]; m=int(sys.argv[2]); work=sys.argv[3]
+parts=re.split(r"(?<=[.!?])\s+",t.strip()); out=[]; cur=""
+for p in parts:
+    while len(p)>m:
+        cut=p.rfind(" ",0,m)
+        if cut<=0: cut=m
+        if cur: out.append(cur); cur=""
+        out.append(p[:cut]); p=p[cut:].strip()
+    if cur and len(cur)+1+len(p)>m: out.append(cur); cur=p
+    else: cur=(cur+" "+p).strip()
+if cur: out.append(cur)
+for i,c in enumerate(out):
+    open(f"{work}/chunk-{i:03d}.txt","w").write(c)
+EOF
+CHUNKS=( "$WORK"/chunk-*.txt )
+N=${#CHUNKS[@]}
+
+# Whole seconds of a WAV file (Python standard library, no ffprobe needed).
+dur() { "$PY" -c 'import wave,sys
+w=wave.open(sys.argv[1]); print(int(w.getnframes()/float(w.getframerate())))' "$1" 2>/dev/null; }
+
+# --- 2. TTS one chunk -> $WORK/part-<i>.wav; prints the duration in seconds ------
+# Returns 1 when the engine produced nothing usable.
+tts_chunk() {  # $1 idx  $2 engine
+  local i="$1" eng="$2" txt prev next http body raw wav
+  raw="$WORK/raw-$(printf %03d "$i")"; wav="$WORK/part-$(printf %03d "$i").wav"
+  txt="$(cat "${CHUNKS[$i]}")"
+  rm -f "$raw".* "$wav"
+  case "$eng" in
+    elevenlabs)
+      prev=""; next=""
+      [ "$i" -gt 0 ] && prev="$(cat "${CHUNKS[$((i-1))]}")"
+      [ "$i" -lt $((N-1)) ] && next="$(cat "${CHUNKS[$((i+1))]}")"
+      body=$("$PY" -c 'import json,sys
+d={"text":sys.argv[1],"model_id":sys.argv[2]}
+if sys.argv[3]: d["previous_text"]=sys.argv[3][-1500:]
+if sys.argv[4]: d["next_text"]=sys.argv[4][:1500]
+print(json.dumps(d))' "$txt" "${ELEVENLABS_MODEL:-eleven_turbo_v2_5}" "$prev" "$next")
+      http=$("$CURL" -sS --max-time 120 -o "$raw.mp3" -w "%{http_code}" \
+        "https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID:-}?output_format=mp3_44100_128" \
+        -H "xi-api-key: ${ELEVENLABS_API_KEY:-}" -H "Content-Type: application/json" -d "$body" || echo 000)
+      if [ "$http" != "200" ]; then
+        echo "jarvis-say: elevenlabs chunk $i http=$http" >&2; return 1
+      fi
+      "$FFMPEG" -nostdin -y -i "$raw.mp3" -ar 44100 -ac 1 "$wav" >/dev/null 2>&1 || return 1 ;;
+    openai)
+      body=$("$PY" -c 'import json,sys;print(json.dumps({"model":"gpt-4o-mini-tts","voice":sys.argv[2],"input":sys.argv[1]}))' "$txt" "${OPENAI_TTS_VOICE:-onyx}")
+      http=$("$CURL" -sS --max-time 120 -o "$raw.mp3" -w "%{http_code}" https://api.openai.com/v1/audio/speech \
+        -H "Authorization: Bearer ${OPENAI_API_KEY:-}" -H "Content-Type: application/json" -d "$body" || echo 000)
+      [ "$http" = "200" ] || { echo "jarvis-say: openai chunk $i http=$http" >&2; return 1; }
+      "$FFMPEG" -nostdin -y -i "$raw.mp3" -ar 44100 -ac 1 "$wav" >/dev/null 2>&1 || return 1 ;;
+    *)
+      if [ -n "${JARVIS_SAY_VOICE:-}" ]; then "$SAY" -v "$JARVIS_SAY_VOICE" -o "$raw.aiff" "$txt" || return 1
+      else "$SAY" -o "$raw.aiff" "$txt" || return 1; fi
+      "$FFMPEG" -nostdin -y -i "$raw.aiff" -ar 44100 -ac 1 "$wav" >/dev/null 2>&1 || return 1 ;;
+  esac
+  [ -s "$wav" ] || return 1
+  dur "$wav"
+}
+
+# --- 3. all chunks; a chunk that comes back implausibly short is regenerated once
+run_engine() {  # $1 engine; fills DURS[]; returns 1 if any chunk failed twice
+  local eng="$1" i d d2 chars floor wav
+  DURS=()
+  for ((i=0;i<N;i++)); do
+    chars=$(wc -c < "${CHUNKS[$i]}" | tr -d ' '); floor=$(( chars / 30 ))   # under half of slow speech = truncated
+    d=$(tts_chunk "$i" "$eng") || d=""
+    if [ -z "$d" ] || [ "$d" -lt "$floor" ]; then
+      echo "$(ts) WARN chunk $i of $N engine=$eng chars=$chars dur=${d:-none} (floor ${floor}s), regenerating" >> "$LOG"
+      wav="$WORK/part-$(printf %03d "$i").wav"
+      [ -n "$d" ] && mv "$wav" "$wav.keep"
+      d2=$(tts_chunk "$i" "$eng") || d2=""
+      if [ -z "$d2" ] && [ -z "$d" ]; then return 1; fi
+      if [ -n "$d2" ] && [ "$d2" -ge "${d:-0}" ]; then d="$d2"; rm -f "$wav.keep"
+      else mv -f "$wav.keep" "$wav"; fi   # the first take was longer: keep it
+      if [ "$d" -lt "$floor" ]; then
+        echo "$(ts) WARN chunk $i of $N engine=$eng still short after retry (dur=${d}s, floor ${floor}s)" >> "$LOG"
+        return 1
+      fi
+    fi
+    DURS[$i]="$d"
+  done
+}
+
+if ! run_engine "$ENGINE"; then
+  if [ "$ENGINE" != "say" ]; then
+    # Resilience: engine down, quota or network -> macOS say, so a voice note still arrives.
+    echo "jarvis-say: $ENGINE produced no usable audio, falling back to macOS say" >&2
+    run_engine say || { echo "jarvis-say: all TTS failed" >&2; exit 1; }
+    ENGINE="say-fallback"
+  else
+    echo "jarvis-say: all TTS failed (engine=say)" >&2; exit 1
+  fi
+fi
+
+# --- 4. merge chunks into the fewest notes that stay under Telegram's 1 MB -------
+GROUPS_SPEC="$("$PY" - "$MAX_NOTE_SEC" "${DURS[@]}" <<'EOF'
+import sys
+cap=int(sys.argv[1]); durs=[int(x) for x in sys.argv[2:]]
+groups=[]; cur=[]; tot=0
+for i,d in enumerate(durs):
+    if cur and tot+d>cap: groups.append(cur); cur=[]; tot=0
+    cur.append(i); tot+=d
+if cur: groups.append(cur)
+print("\n".join(" ".join(map(str,g)) for g in groups))
+EOF
+)"
+OGGS=()
+gi=0
+while IFS= read -r IDXS; do
+  [ -n "$IDXS" ] || continue
+  LIST="$WORK/list-$gi.txt"; : > "$LIST"; TOT=0
+  for i in $IDXS; do echo "file 'part-$(printf %03d "$i").wav'" >> "$LIST"; TOT=$(( TOT + ${DURS[$i]:-0} )); done
+  [ "$TOT" -lt 1 ] && TOT=1
+  KBPS=$(( NOTE_BYTES * 8 / TOT / 1000 ))
+  [ "$KBPS" -gt "$MAX_KBPS" ] && KBPS=$MAX_KBPS
+  [ "$KBPS" -lt "$MIN_KBPS" ] && KBPS=$MIN_KBPS
+  NAME="$("$PY" -c 'import time;print(time.time_ns())')-${TOPIC}.ogg"
+  OGG="$BATCH/$NAME"
+  # Encode, measure the real size, and re-encode lower until it fits (Opus can overshoot its target).
+  while :; do
+    rm -f "$OGG"
+    if ! "$FFMPEG" -nostdin -y -f concat -safe 0 -i "$LIST" -c:a libopus -b:a "${KBPS}k" -vbr constrained -application voip "$OGG" >/dev/null 2>&1 || [ ! -s "$OGG" ]; then
+      echo "jarvis-say: ffmpeg merge failed" >&2; exit 1
+    fi
+    SIZE=$(wc -c < "$OGG" | tr -d ' ')
+    [ "$SIZE" -le "$LIMIT" ] && break
+    if [ "$KBPS" -le "$MIN_KBPS" ]; then
+      # Only reachable with a very low JARVIS_SAY_LIMIT_BYTES: the note is still sent
+      # (Telegram then shows it as an audio file instead of a voice note), never dropped.
+      echo "$(ts) WARN note $gi is ${SIZE} bytes even at ${MIN_KBPS}k (Telegram may show it as an audio file)" >> "$LOG"; break
+    fi
+    NEW=$(( KBPS * NOTE_BYTES / SIZE ))
+    [ "$NEW" -ge "$KBPS" ] && NEW=$(( KBPS - 2 ))
+    [ "$NEW" -lt "$MIN_KBPS" ] && NEW=$MIN_KBPS
+    KBPS=$NEW
+  done
+  OGGS+=( "$OGG" ); gi=$((gi+1))
+done <<< "$GROUPS_SPEC"
+TOTAL_DUR=0; for d in "${DURS[@]}"; do TOTAL_DUR=$(( TOTAL_DUR + d )); done
+INFO="engine=$ENGINE topic=$TOPIC chars=${#TEXT} chunks=$N dur=${TOTAL_DUR}s notes=${#OGGS[@]}"
+
+# --- 5. park for the bridge (voice last) or send live ----------------------------
+if [ -n "$DEFER" ]; then
+  # One atomic rename of the whole batch. Fails if the bridge already flushed this
+  # turn (folder renamed away): then every note is sent live below, in order.
+  if mv "$BATCH" "$DEFER/batch-$P" 2>/dev/null; then
+    echo "$(ts) queued voice $INFO" >> "$LOG"
+    echo "jarvis-say: ok ($INFO, posts right after your text reply)"
+    exit 0
+  fi
+  # The user pressed Stop on this turn: the bridge left "<folder>.discarded" as a
+  # marker. Drop the note instead of sending the cancelled answer live.
+  if [ -d "$STOP_MARK" ]; then
+    echo "$(ts) dropped voice (turn was stopped) $INFO" >> "$LOG"
+    echo "jarvis-say: turn was stopped, voice note dropped"
+    exit 0
+  fi
+fi
+
+if [ -n "$STOP_MARK" ] && [ -d "$STOP_MARK" ]; then
+  echo "$(ts) dropped voice (turn was stopped) $INFO" >> "$LOG"
+  echo "jarvis-say: turn was stopped, voice note dropped"; exit 0
+fi
+RESP="$WORK/resp.json"
+for OGG in "${OGGS[@]}"; do
+  HTTP=$("$CURL" -sS --max-time 120 -o "$RESP" -w "%{http_code}" \
+    "https://api.telegram.org/bot${TOKEN}/sendVoice" \
+    --form-string "chat_id=${GROUP}" --form-string "message_thread_id=${TOPIC}" \
+    -F "voice=@${OGG};type=audio/ogg" || echo 000)
+  rm -f "$OGG"
+  if [ "$HTTP" != "200" ]; then
+    echo "jarvis-say: sendVoice failed http=$HTTP $(head -c 300 "$RESP" 2>/dev/null)" >&2; exit 1
+  fi
+done
+echo "$(ts) sent voice $INFO" >> "$LOG"
+echo "jarvis-say: ok ($INFO)"

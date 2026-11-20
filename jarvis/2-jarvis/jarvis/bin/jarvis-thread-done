@@ -1,0 +1,43 @@
+#!/bin/bash
+# jarvis-thread-done <thread_id> ["summary"]
+# Human-override close: mark a thread done regardless of its last marker
+# (the owner said "that's done / close it"). Sets closed_by_human so a turn that
+# is still in flight cannot re-open the thread when it commits (its late turn
+# is kept for the record only). Resolves the open-item pointer too. To also
+# STOP a live worker, use jarvis-thread-kill instead. A later explicit
+# jarvis-thread-tell re-opens the thread on purpose.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY=/usr/bin/python3
+
+ID="${1:?usage: jarvis-thread-done <thread_id> [summary]}"
+SUMMARY="${2:-closed by owner}"
+
+if [ "${JARVIS_WORKER:-}" = "1" ]; then
+  echo "ERROR: a worker cannot close threads (JARVIS_WORKER=1)" >&2
+  exit 3
+fi
+
+exec "$PY" - "$DIR" "$ID" "$SUMMARY" <<'PY'
+import sys, os
+DIR, ID, SUMMARY = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, DIR)
+import _state, _threadlib
+t = _threadlib.get_thread(ID)
+if not t:
+    sys.stderr.write("ERROR: no such thread %s\n" % ID)
+    sys.exit(2)
+_state.set_thread(ID, {"status": "done", "done_at": _state._now(),
+                       "closed_by_human": True,
+                       "last_status_line": SUMMARY})
+# resolve the thread's open-item pointer(s)
+d = _state._load(_state.ITEMS, {"items": []})
+changed = False
+for it in d.get("items", []):
+    if it.get("kind") == "thread" and it.get("ref") == ID and it.get("status") == "open":
+        it["status"] = "resolved"
+        changed = True
+if changed:
+    _state._save(_state.ITEMS, d)
+print("done %s" % ID)
+PY

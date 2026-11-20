@@ -1,0 +1,44 @@
+#!/bin/bash
+# jarvis-morning -- 08:00 LaunchAgent. Drops the morning-brief trigger into the
+# bridge; the Jarvis session then writes ONE brief (one voice note + one text).
+# The desktop-sync report (07:30 LaunchAgent) is ready by now; the brief reads it.
+set -eo pipefail
+. "$(dirname "$0")/../bin/_env.sh"
+require_topic
+mkdir -p "$TRIGGER_DIR"
+
+TRIG="$TRIGGER_DIR/jarvis-morning-$(date +%s).json"
+"$PY" - "$JARVIS_TOPIC_ID" "$TRIG" "$JSTATE" "$JARVIS_HOME" "$JARVIS_OWNER" <<'PYM'
+import json, os, sys
+topic, trig, state, home, owner = sys.argv[1:6]
+prompt = (
+    f"You are Jarvis. This is the automated MORNING BRIEF trigger, NOT a message from {owner}, so do not repeat it back. "
+    f"Read your standing orders ({state}/standing-orders.md: the Morning brief and One-off for tomorrow sections), "
+    f"your recent journal ({state}/journal.md), and your live state ({state}/open-items.json, {state}/jobs.json, "
+    f"and run bash {home}/bin/jarvis-thread-list). "
+    f"Also read TODAY's desktop-sync report, the freshest dated .md in {state}/desktop-sync/: it reconciles the open queue "
+    f"against what {owner} ACTUALLY did in desktop Claude Code sessions yesterday. FRESHNESS GUARD: check the report's date first - "
+    "if the freshest report is NOT dated today, do not trust it over the live queue; say in one line that today's sync is missing "
+    "and lean on live sources instead. When it IS today's: never present an item as "
+    "pending when the report shows it was already done on desktop; put its proposed closes in ONE grouped line that can be approved with "
+    "a word; mention its 'spotted untracked' finds only if genuinely worth attention. "
+    f"Then talk to {owner} DIRECTLY in your own voice (second person): greet them for the day and give a TIGHT brief - where things stand, "
+    "what is running, what needs them today, flag anything dormant by recency. "
+    "Include a short OPEN THREADS section: from jarvis-thread-list, one line per open thread - name, status (running / needs-input / idle Nd), "
+    "and what it is waiting on - so they can answer with 'close X, keep Y going' in one message. If there are none, one line: no open threads. "
+    "ONE MESSAGE RULE: the ENTIRE brief is ONE turn, ONE jarvis-say voice note, ONE final text block. Do NOT spawn workers (jarvis-spawn) for the brief. "
+    "Any live numbers or fact-checks the brief needs (standing-orders stats, git log, calendar, live queue state), pull INLINE yourself "
+    "with direct tool calls in THIS turn - fast reads only, budget ~2 minutes for them. If a pull fails or would take too long, "
+    "write 'could not pull X this morning' in the brief instead of splitting into a second message. Never announce that data is coming later. "
+    "If the One-off for tomorrow section has items, include them, then rewrite that section back to '- (none)'. "
+    "Do ALL tool calls (reads, pulls, jarvis-say) FIRST, then write the FULL brief as your final text block (the bridge only posts text "
+    "written after your last tool call); voice and text carry the same content, any questions numbered in the text. "
+    "Casual, lead with the point, no em dashes."
+)
+# Atomic write: the bridge's 5s watcher deletes any *.json that parses as
+# malformed; '.json.tmp' never matches its *.json glob.
+tmp = trig + ".tmp"
+json.dump({"topic_id": int(topic), "prompt": prompt, "sender": "jarvis-morning"}, open(tmp, "w"))
+os.replace(tmp, trig)
+print("morning trigger dropped")
+PYM

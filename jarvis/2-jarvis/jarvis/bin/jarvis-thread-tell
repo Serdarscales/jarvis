@@ -1,0 +1,58 @@
+#!/bin/bash
+# jarvis-thread-tell <thread_id> "<input>"
+# Feed the next turn (a --resume) to an existing thread, DETACHED. Returns
+# immediately; the completion ping wakes the conductor when the turn finishes.
+# If the thread is mid-turn (busy) or the governor is full (queued), the input
+# is AUTO-QUEUED to pending-inputs.json and delivered the moment capacity
+# frees -- it is never lost. A tell that lands before turn 1 has started also
+# queues (it must not race the --first turn for the flock).
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+JARVIS="$(cd "$DIR/.." && pwd)"
+PY=/usr/bin/python3
+
+ID="${1:?usage: jarvis-thread-tell <thread_id> <input>}"
+INPUT="${2:?usage: jarvis-thread-tell <thread_id> <input>}"
+
+if [ "${JARVIS_WORKER:-}" = "1" ]; then
+  echo "ERROR: a worker cannot drive threads (JARVIS_WORKER=1)" >&2
+  exit 3
+fi
+
+# mirror _state.STATE resolution (JARVIS_STATE_DIR override else the symlink)
+STATE="${JARVIS_STATE_DIR:-$JARVIS/state}"
+
+# validate + S2 race guard in one pass (DIR/ID/INPUT passed as argv, never
+# interpolated into code). Prints: nothread | queued | ok
+GATE=$("$PY" - "$DIR" "$ID" "$INPUT" <<'PYQ'
+import sys
+DIR, ID, INPUT = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, DIR)
+import _state, _threadcore, _threadlib
+t = _threadlib.get_thread(ID)
+if not t:
+    print("nothread")
+elif t.get("status") == "spawning" and not t.get("turns_count"):
+    # turn 1 has not committed yet: a tell now would race the --first turn
+    # for the flock and --resume a session that does not exist yet (S2)
+    _threadcore.pending_add(ID, INPUT, "spawning", state_dir=_state.STATE)
+    print("queued")
+else:
+    print("ok")
+PYQ
+)
+case "$GATE" in
+  nothread)
+    echo "ERROR: no such thread $ID" >&2
+    exit 2 ;;
+  queued)
+    echo "queued behind turn 1 for $ID (auto-delivers when it ends)"
+    exit 0 ;;
+esac
+
+mkdir -p "$STATE/threads"
+RUNLOG="$STATE/threads/$ID.run.log"
+nohup bash "$DIR/jarvis-thread-run" "$ID" "$INPUT" >>"$RUNLOG" 2>&1 </dev/null &
+disown 2>/dev/null || true
+
+echo "spawned turn for $ID"

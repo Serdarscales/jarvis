@@ -1,0 +1,84 @@
+#!/bin/bash
+# jarvis-prune -- bounds long-term growth. Run nightly by jarvis-handover.
+# Touches only the Jarvis state dir, except the documented thread-session
+# archive below.
+set -eo pipefail
+CRON="$(cd "$(dirname "$0")" && pwd)"
+. "$CRON/../bin/_env.sh"
+"$PY" - "$JSTATE" <<'PYP'
+import json, os, sys, time
+from datetime import datetime, timedelta
+jstate = sys.argv[1]
+
+# 1) trim jobs.json: keep all running + most recent 200 done
+jp = os.path.join(jstate, "jobs.json")
+try:
+    d = json.load(open(jp)); jobs = d.get("jobs", [])
+    running = [j for j in jobs if j.get("status") == "running"]
+    done = [j for j in jobs if j.get("status") != "running"]
+    keep = running + done[-200:]
+    if len(keep) < len(jobs):
+        d["jobs"] = keep; tmp = jp + ".tmp"; json.dump(d, open(tmp, "w"), indent=2); os.replace(tmp, jp)
+        print(f"jobs pruned {len(jobs)}->{len(keep)}")
+except Exception as e:
+    print("jobs prune skip:", e)
+
+# 2) drop resolved open-items older than 30 days (keep all open + recent resolved)
+ip = os.path.join(jstate, "open-items.json")
+try:
+    d = json.load(open(ip)); items = d.get("items", []); cut = datetime.now() - timedelta(days=30); kept = []
+    for it in items:
+        if it.get("status") == "open":
+            kept.append(it); continue
+        try: tsv = datetime.strptime(it.get("ts", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError: kept.append(it); continue
+        if tsv >= cut: kept.append(it)
+    if len(kept) < len(items):
+        d["items"] = kept; tmp = ip + ".tmp"; json.dump(d, open(tmp, "w"), indent=2); os.replace(tmp, ip)
+        print(f"open-items pruned {len(items)}->{len(kept)}")
+except Exception as e:
+    print("items prune skip:", e)
+
+# 3) delete worker outputs/logs older than 14 days
+od = os.path.join(jstate, "outputs"); cutsec = time.time() - 14 * 86400; n = 0
+if os.path.isdir(od):
+    for f in os.listdir(od):
+        p = os.path.join(od, f)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutsec:
+                os.remove(p); n += 1
+        except OSError:
+            pass
+    if n: print(f"outputs deleted {n}")
+
+# 4) cap .stuck-flagged to last 100
+sf = os.path.join(jstate, ".stuck-flagged.json")
+try:
+    fl = json.load(open(sf))
+    if isinstance(fl, list) and len(fl) > 100:
+        json.dump(sorted(fl)[-100:], open(sf, "w")); print("stuck-flagged capped")
+except Exception:
+    pass
+
+# 5) journal rotation: keep the newest ~400KB live, move the rest to a dated archive
+jn = os.path.join(jstate, "journal.md"); cap = 400 * 1024
+try:
+    if os.path.getsize(jn) > cap:
+        data = open(jn).read()
+        cut_at = data.find("\n## ", len(data) - cap)
+        if cut_at > 0:
+            arch = os.path.join(jstate, "journal-archive-%s.md" % datetime.now().strftime("%Y-%m-%d"))
+            with open(arch, "a") as f: f.write(data[:cut_at + 1])
+            tmp = jn + ".tmp"; open(tmp, "w").write(data[cut_at + 1:]); os.replace(tmp, jn)
+            print("journal rotated ->", os.path.basename(arch))
+except OSError:
+    pass
+print("prune done")
+PYP
+
+# Threads prune: archives a DONE thread's session JSONL out of
+# ~/.claude/projects, but ONLY by EXACT uuid from threads.json (never an
+# age-glob of that shared dir) and only after gzipping it into
+# state/archived-sessions first. Also rolls up oversized transcripts and
+# sweeps stale per-invocation logs (all inside the state dir).
+"$PY" "$CRON/_threadcron.py" prune || true

@@ -1,0 +1,47 @@
+#!/bin/bash
+# jarvis-send-text "<text>"  -> posts TEXT into the Jarvis Telegram topic via the bot.
+# Jarvis's normal reply already arrives as text, but a very long reply or one
+# with markdown that fails to format can be dropped. When the owner must SEE or
+# COPY exact words (a prompt, a link, a code block), send them with THIS too.
+# Auto-splits into <3900-char chunks (Telegram rejects messages over ~4096).
+set -eo pipefail
+. "$(dirname "$0")/_env.sh"
+require_topic
+CURL="/usr/bin/curl"
+
+TEXT="${1:?usage: jarvis-send-text <text>}"
+TOKEN=$(bridge_cred TELEGRAM_BOT_TOKEN)
+GROUP=$(bridge_cred TELEGRAM_GROUP_ID)
+WORK=$(mktemp -d /tmp/jarvis-send-text.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+# split into <=3900-char chunks on line boundaries, one file per chunk
+"$PY" - "$TEXT" "$WORK" <<'PYEOF'
+import sys, os
+t, work = sys.argv[1], sys.argv[2]; lim = 3900; out = []; cur = ""
+for line in t.split("\n"):
+    if len(cur) + len(line) + 1 > lim and cur:
+        out.append(cur); cur = ""
+    cur += (("\n" if cur else "") + line)
+    while len(cur) > lim:
+        out.append(cur[:lim]); cur = cur[lim:]
+if cur: out.append(cur)
+for i, c in enumerate(out):
+    open(os.path.join(work, "part-%04d.txt" % i), "w").write(c)
+PYEOF
+
+rc=0; N=0
+for PART in "$WORK"/part-*.txt; do
+  N=$((N+1))
+  HTTP=$("$CURL" -sS -o "$WORK/resp.json" -w "%{http_code}" \
+    "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${GROUP}" \
+    --data-urlencode "message_thread_id=${JARVIS_TOPIC_ID}" \
+    --data-urlencode "text@${PART}")
+  OK=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get('ok'))" "$WORK/resp.json" 2>/dev/null || echo False)
+  [ "$OK" = "True" ] || { rc=1; echo "jarvis-send-text: chunk $N FAILED http=$HTTP $(cat "$WORK/resp.json")"; }
+done
+mkdir -p "$JSTATE"
+echo "$(ts) sent text topic=$JARVIS_TOPIC_ID chunks=$N chars=${#TEXT} rc=$rc" >> "$JSTATE/jarvis-say.log"
+[ "$rc" = 0 ] && echo "jarvis-send-text: ok (topic=$JARVIS_TOPIC_ID, chunks=$N)" || echo "jarvis-send-text: PARTIAL/FAIL (see above)"
+exit $rc

@@ -1,0 +1,70 @@
+#!/bin/bash
+# jarvis-spawn "<task prompt>"  -> registers a job, runs a detached headless
+# claude worker, and ALWAYS fires jarvis-notify when the worker exits (even if
+# the model forgets), so the completion ping is guaranteed. Prints the job id.
+set -eo pipefail
+. "$(dirname "$0")/_env.sh"
+WORKER_TIMEOUT="${JARVIS_WORKER_TIMEOUT:-7200}"  # 120 min; long renders need it
+
+TASK="${1:?usage: jarvis-spawn <task prompt>}"
+
+if [ "${JARVIS_WORKER:-}" = "1" ]; then
+  echo "ERROR: a worker cannot spawn workers (JARVIS_WORKER=1)" >&2
+  exit 3
+fi
+
+JOB_ID="job-$(date +%Y%m%d-%H%M%S)-$$"
+OUT="$JSTATE/outputs/$JOB_ID.md"
+LOG="$JSTATE/outputs/$JOB_ID.log"
+mkdir -p "$JSTATE/outputs"
+
+# register the job
+"$PY" "$JARVIS_HOME/bin/_state.py" add_job "$JOB_ID" "$TASK" >/dev/null
+
+WORKER_PROMPT="$TASK
+
+IMPORTANT: when you are completely finished, write your full result (markdown) to this exact file: $OUT
+Keep the FIRST line of that file a one-sentence summary of what you did. Then stop."
+
+# Detached worker. The subshell runs claude, then guarantees a completion notify.
+(
+  export USER="${USER:-$(whoami)}"
+  export LOGNAME="${LOGNAME:-$USER}"
+  export JARVIS_WORKER=1
+  cd "$JARVIS_WORKSPACE"
+  "$CLAUDE_BIN" -p "$WORKER_PROMPT" \
+    --model "$JARVIS_MODEL" \
+    --strict-mcp-config \
+    --setting-sources project \
+    --dangerously-skip-permissions >"$LOG" 2>&1 &
+  wpid=$!
+  # Wall-clock watchdog in 15s slices: a single `sleep N` pauses while the Mac
+  # sleeps, so a plain sleep-then-kill can fire hours late.
+  (
+    wstart=$(date +%s)
+    while kill -0 "$wpid" 2>/dev/null; do
+      if [ $(( $(date +%s) - wstart )) -ge "$WORKER_TIMEOUT" ]; then
+        : > "$LOG.timeout"
+        kill "$wpid" 2>/dev/null; sleep 10; kill -9 "$wpid" 2>/dev/null
+        break
+      fi
+      sleep 15
+    done
+  ) & killer=$!
+  # set -e is on: a bare failing `wait` would end this subshell before the
+  # notify below, so a crashed or timed-out worker never pinged. Capture rc.
+  rc=0; wait "$wpid" 2>/dev/null || rc=$?
+  kill "$killer" 2>/dev/null || true
+  if [ -s "$OUT" ]; then
+    SUMMARY=$(head -1 "$OUT" | cut -c1-280)
+  elif [ -f "$LOG.timeout" ]; then
+    SUMMARY="worker hit the ${WORKER_TIMEOUT}s timeout and was stopped; partial work may be in its log"
+  else
+    SUMMARY="worker finished (exit $rc) but wrote no output file; see log"
+  fi
+  rm -f "$LOG.timeout"
+  "$JARVIS_HOME/bin/jarvis-notify" "$SUMMARY" "$JOB_ID" >/dev/null 2>&1 || true
+) </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+echo "$JOB_ID"

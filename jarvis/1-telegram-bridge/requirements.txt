@@ -1,0 +1,10 @@
+# Core
+python-telegram-bot>=21.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+telegramify-markdown>=1.0.0
+Pillow>=10.0.0
+
+# Optional: only needed for WHISPER_PROVIDER=local (voice notes, Apple Silicon only).
+# Comment this line out on Intel Macs or if you use the openai/groq provider instead.
+mlx-whisper>=0.4.0

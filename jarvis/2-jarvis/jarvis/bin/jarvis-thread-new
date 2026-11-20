@@ -1,0 +1,29 @@
+#!/bin/bash
+# jarvis-thread-new "<name>" "<task>"
+# Allocate a thread id + session uuid, write its charter from the template,
+# register the thread row + open-item pointer, then fire turn 1 DETACHED and
+# print the thread id immediately. A worker (JARVIS_WORKER=1) may not open
+# new top-level threads.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY=/usr/bin/python3
+
+NAME="${1:?usage: jarvis-thread-new <name> <task>}"
+TASK="${2:?usage: jarvis-thread-new <name> <task>}"
+
+if [ "${JARVIS_WORKER:-}" = "1" ]; then
+  echo "ERROR: a worker cannot open new top-level threads (JARVIS_WORKER=1)" >&2
+  exit 3
+fi
+
+# create + register; prints one tab-separated line: <id>\t<state_dir>
+LINE="$("$PY" "$DIR/_threadlib.py" new "$NAME" "$TASK")"
+ID="${LINE%%$'\t'*}"
+STATE="${LINE#*$'\t'}"
+
+mkdir -p "$STATE/threads"
+RUNLOG="$STATE/threads/$ID.run.log"
+nohup bash "$DIR/jarvis-thread-run" "$ID" --first "$TASK" >>"$RUNLOG" 2>&1 </dev/null &
+disown 2>/dev/null || true
+
+echo "$ID"

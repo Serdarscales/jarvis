@@ -1,0 +1,60 @@
+#!/bin/bash
+# jarvis-watch -- every 20 min (LaunchAgent).
+#   (a) Jarvis context >= threshold and the bridge is idle -> journal + reset (jarvis-handover)
+#   (b) a one-shot worker running too long -> one heads-up trigger
+#   (c) the threads safety sweep (stalls, lost pings, stuck queued inputs, CLI updates)
+set -eo pipefail
+CRON="$(cd "$(dirname "$0")" && pwd)"
+. "$CRON/../bin/_env.sh"
+require_topic
+TOKUSAGE="$BRIDGE_DIR/state/token_usage.json"
+THRESHOLD="${JARVIS_CTX_THRESHOLD:-500000}"   # tokens; needs a 1M-window model, use ~150000 on a 200K-window model
+STUCK_MIN="${JARVIS_STUCK_MIN:-35}"
+TOPIC="$JARVIS_TOPIC_ID"
+LOG="$JSTATE/watch.log"
+mkdir -p "$JSTATE"
+
+CTX=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],{}).get('input_tokens',0))" "$TOKUSAGE" "$TOPIC" 2>/dev/null || echo 0)
+if [ "${CTX:-0}" -ge "$THRESHOLD" ]; then
+  echo "$(ts) ctx=$CTX >= $THRESHOLD -> handover" >>"$LOG"
+  bash "$CRON/jarvis-handover" "threshold-${CTX}" >>"$LOG" 2>&1 || true
+fi
+
+# prefix every stdout line with a timestamp so cron-watch.out stays readable
+stamp(){ while IFS= read -r line; do echo "$(ts) $line"; done; }
+
+"$PY" - "$JSTATE" "$STUCK_MIN" "$TRIGGER_DIR" "$TOPIC" "$JARVIS_OWNER" <<'PYS' | stamp
+import json, sys, os, time
+from datetime import datetime
+jstate, stuck_min, trig_dir, topic, owner = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5]
+jobs_path = os.path.join(jstate, "jobs.json"); flag_path = os.path.join(jstate, ".stuck-flagged.json")
+try: jobs = json.load(open(jobs_path)).get("jobs", [])
+except Exception: jobs = []
+try: flagged = set(json.load(open(flag_path)))
+except Exception: flagged = set()
+now = datetime.now(); newly = []
+for j in jobs:
+    if j.get("status") != "running" or j.get("id") in flagged: continue
+    st = j.get("started")
+    if not st: continue
+    try: mins = (now - datetime.strptime(st, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+    except ValueError: continue
+    if mins >= stuck_min:
+        newly.append((j["id"], int(mins), (j.get("task") or "")[:160])); flagged.add(j["id"])
+if newly:
+    lines = "; ".join(f"{i} running {m}m: {t}" for i, m, t in newly)
+    prompt = ("You are Jarvis (read your persona if you lack context). This is a background trigger, NOT a message "
+              f"from {owner}, so do not repeat it back. These workers have run a long time and may be slow or stuck: "
+              f"{lines}. Talk to {owner} DIRECTLY in your own voice (text + jarvis-say): a short honest heads up, and "
+              "ask whether to keep waiting or kill it. No em dashes.")
+    os.makedirs(trig_dir, exist_ok=True)
+    trig = os.path.join(trig_dir, f"jarvis-stuck-{int(time.time())}.json")
+    json.dump({"topic_id": topic, "prompt": prompt, "sender": "jarvis-watch"}, open(trig + ".tmp", "w"))
+    os.replace(trig + ".tmp", trig)
+    json.dump(sorted(flagged), open(flag_path, "w"))
+    print("flagged stuck:", [n[0] for n in newly])
+PYS
+
+# threads engine sweep: stalls, lost completion pings, 3h re-asks, stuck
+# queued inputs, CLI-version canary; then reap dead governor slots.
+"$PY" "$CRON/_threadcron.py" watch_sweep "$TRIGGER_DIR" "$TOPIC" 2>&1 | stamp || true

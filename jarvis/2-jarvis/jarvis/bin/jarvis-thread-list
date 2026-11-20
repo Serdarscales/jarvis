@@ -1,0 +1,8 @@
+#!/bin/bash
+# jarvis-thread-list [filter]
+# Print open + done threads from threads.json with status, turns, name, etc.
+# (turn text stripped). Optional filter matches status, name substring, or
+# exact id -- used for by-name -> id resolution by the conductor.
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec /usr/bin/python3 "$DIR/_state.py" list_threads "$@"

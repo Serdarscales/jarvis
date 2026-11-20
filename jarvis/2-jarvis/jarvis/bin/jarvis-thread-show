@@ -1,0 +1,7 @@
+#!/bin/bash
+# jarvis-thread-show <thread_id> [N=3]
+# Render the last N committed turns of a thread. If the rendered text exceeds
+# ~3500 chars, write it to state/outputs/ and print THAT path (send as a FILE).
+set -eo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec /usr/bin/python3 "$DIR/_threadshow.py" "$@"
